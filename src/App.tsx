@@ -11,17 +11,18 @@ function App() {
   const apiBaseUrl =
     (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:3000";
   const askUrl = useMemo(() => new URL("/ask", apiBaseUrl).toString(), [apiBaseUrl]);
-  const uploadUrl = useMemo(() => new URL("/upload", apiBaseUrl).toString(), [apiBaseUrl]);
+   const uploadUrl = useMemo(() => new URL("/upload", apiBaseUrl).toString(), [apiBaseUrl]);
 
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<"landing" | "chat">("landing");
-  const [documentId, setDocumentId] = useState<string | null>(null);
+  const [documentId, setDocumentId] = useState<string | null>("default"); // Default PDF available
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadedFileInfo, setUploadedFileInfo] = useState<{ filename: string; pageCount: number } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -37,6 +38,22 @@ function App() {
       createdAt: Date.now(),
     };
     setMessages((m) => [...m, msg]);
+    return msg.id;
+  }
+
+  function updateMessage(id: string, contentOrUpdater: string | ((prev: string) => string)){
+    setMessages((msgs) => 
+      msgs.map((m) => 
+        m.id === id
+          ? {
+              ...m,
+              content: typeof contentOrUpdater === "function" 
+              ? contentOrUpdater(m.content)
+              : contentOrUpdater,
+          }
+        : m
+      )
+    );
   }
 
   async function send() {
@@ -52,7 +69,7 @@ function App() {
       const res = await fetch(askUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: trimmed, documentId }),
+        body: JSON.stringify({ message: trimmed, documentId, stream: false }), // Non-streaming by default (faster)
       });
 
       if (!res.ok) {
@@ -60,13 +77,63 @@ function App() {
         throw new Error(`Request failed (${res.status}). ${text}`.trim());
       }
 
-      const data = (await res.json()) as { answer?: string };
-      addMessage("assistant", data.answer ?? "No answer returned by server.");
+      const contentType = res.headers.get("content-type") || "";
+      
+      if (contentType.includes("text/event-stream")) {
+        // STREAMING MODE (shows progress, but slower)
+        const assistantMsgId = addMessage("assistant", "");
+        const reader = res.body?.getReader();
+        if (!reader) {
+          throw new Error("Response body is not readable");
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              const jsonStr = line.slice(6);
+              if (jsonStr.trim() === "[DONE]") {
+                setIsSending(false);
+                return;
+              }
+
+              try {
+                const data = JSON.parse(jsonStr);
+                if (data.error) {
+                  setError(data.error);
+                  updateMessage(assistantMsgId, `Error: ${data.error}`);
+                  setIsSending(false);
+                  return;
+                }
+                if (data.token) {
+                  updateMessage(assistantMsgId, (prev) => prev + data.token);
+                }
+              } catch (e) {
+                console.error("Failed to parse SSE data:", e, jsonStr);
+              }
+            }
+          }
+        }
+        setIsSending(false);
+      } else {
+        // NON-STREAMING MODE (faster, simpler)
+        const data = (await res.json()) as { answer?: string };
+        addMessage("assistant", data.answer ?? "No answer returned by server.");
+        setIsSending(false);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
       addMessage("assistant", `Sorry — I hit an error talking to the server.\n\n${msg}`);
-    } finally {
       setIsSending(false);
     }
   }
@@ -75,6 +142,14 @@ function App() {
     setError(null);
     setMessages([]);
     setInput("");
+  }
+
+  function removeDocument() {
+    setDocumentId("default");
+    setUploadedFileInfo(null);
+    setSelectedFile(null);
+    clearChat();
+    setView("landing");
   }
 
   async function uploadPdf() {
@@ -92,15 +167,24 @@ function App() {
         throw new Error(`Upload failed (${res.status}). ${text}`.trim());
       }
 
-      const data = (await res.json()) as { documentId?: string; filename?: string };
+      const data = (await res.json()) as { documentId?: string; filename?: string; pageCount?: number };
       if (!data.documentId) throw new Error("Upload succeeded but no documentId returned.");
 
+      // Debug: log response data
+      console.log("Upload response:", data);
+      console.log("Page count from server:", data.pageCount);
+
       setDocumentId(data.documentId);
+      setUploadedFileInfo({
+        filename: data.filename ?? selectedFile.name,
+        pageCount: data.pageCount ?? 0,
+      });
+      setSelectedFile(null);
       setView("chat");
       clearChat();
       addMessage(
         "assistant",
-        `Uploaded: ${data.filename ?? selectedFile.name}\n\nAsk me anything about this PDF.`
+        `Uploaded: ${data.filename ?? selectedFile.name} (${data.pageCount ?? 0} pages)\n\nAsk me anything about this PDF.`
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -109,12 +193,6 @@ function App() {
       setIsUploading(false);
     }
   }
-
-  const quickPrompts = [
-    "Summarize the document in 5 bullet points.",
-    "What are the key definitions mentioned?",
-    "Give me a short glossary of important terms.",
-  ];
 
   const panelBase =
     "absolute inset-0 transition-all duration-300 ease-out motion-reduce:transition-none";
@@ -131,7 +209,6 @@ function App() {
             </div>
             <div>
               <div className="text-sm font-semibold leading-tight">PDF RAG Chatbot</div>
-              <div className="text-xs text-slate-500">Ask questions. Get answers from your PDF.</div>
             </div>
           </div>
 
@@ -158,24 +235,6 @@ function App() {
                 Clear
               </button>
             </div>
-
-            <div
-              className={[
-                "absolute right-0 top-0 transition-all duration-200 ease-out motion-reduce:transition-none",
-                view === "landing"
-                  ? "opacity-100 translate-y-0"
-                  : "pointer-events-none opacity-0 -translate-y-1",
-              ].join(" ")}
-              aria-hidden={view !== "landing"}
-            >
-              <button
-                type="button"
-                onClick={() => setView("chat")}
-                className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition-colors duration-200 hover:bg-slate-800 active:translate-y-px motion-reduce:transition-none"
-              >
-                Start
-              </button>
-            </div>
           </div>
         </header>
 
@@ -191,37 +250,24 @@ function App() {
                   Chat with your document.
                 </h1>
                 <p className="mt-4 max-w-2xl text-base leading-relaxed text-slate-600">
-                  A minimal RAG interface that answers using your PDF’s content. Keep questions
+                  A minimal RAG interface that answers using your PDF's content. Keep questions
                   specific for best results.
                 </p>
 
-                <div className="mt-6 flex flex-wrap gap-2">
-                  {quickPrompts.map((p) => (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => {
-                        setInput(p);
-                        setView("chat");
-                      }}
-                      className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700 transition-colors duration-200 hover:bg-slate-50 active:translate-y-px motion-reduce:transition-none"
-                    >
-                      {p}
-                    </button>
-                  ))}
-                </div>
-
                 <div className="mt-8">
                   <div className="text-sm font-semibold">Upload your PDF</div>
-                  <div className="mt-1 text-sm text-slate-600">
-                    Your PDF is kept in memory only (lost when the server restarts).
-                  </div>
 
                   {uploadError ? (
                     <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                       <span className="font-semibold">Upload error:</span> {uploadError}
                     </div>
                   ) : null}
+
+                  {selectedFile && !isUploading && (
+                    <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                      Selected: <span className="font-medium">{selectedFile.name}</span>
+                    </div>
+                  )}
 
                   <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
                     <input
@@ -240,27 +286,6 @@ function App() {
                     </button>
                   </div>
                 </div>
-
-                <div className="mt-8 flex flex-wrap items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setView("chat")}
-                    className="rounded-xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition-colors duration-200 hover:bg-slate-800 active:translate-y-px motion-reduce:transition-none"
-                  >
-                    Start chatting
-                  </button>
-                  <div className="text-xs text-slate-500">
-                    Backend: <span className="font-mono">{apiBaseUrl}</span>
-                    {documentId ? (
-                      <>
-                        {" "}
-                        · Doc: <span className="font-mono">{documentId}</span>
-                      </>
-                    ) : (
-                      <> · Doc: <span className="font-mono">default</span></>
-                    )}
-                  </div>
-                </div>
               </div>
             </div>
           </main>
@@ -273,11 +298,31 @@ function App() {
             <div className="flex h-full flex-col overflow-y-auto py-8">
               <section className="flex flex-1 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white">
                 <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-                  <div className="text-sm font-medium">Chat</div>
-                  <div className="text-xs text-slate-500">
-                    {isSending
-                      ? "Thinking…"
-                      : `${messages.length} message${messages.length === 1 ? "" : "s"}`}
+                  <div className="flex items-center gap-3">
+                    <div className="text-sm font-medium">Chat</div>
+                    {uploadedFileInfo && (
+                      <div className="flex items-center gap-2 text-xs text-slate-500">
+                        <span>📄 {uploadedFileInfo.filename}</span>
+                        <span>·</span>
+                        <span>{uploadedFileInfo.pageCount} page{uploadedFileInfo.pageCount !== 1 ? "s" : ""}</span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {uploadedFileInfo && (
+                      <button
+                        type="button"
+                        onClick={removeDocument}
+                        className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors duration-200 hover:bg-slate-50 active:translate-y-px motion-reduce:transition-none"
+                      >
+                        Remove & Reupload
+                      </button>
+                    )}
+                    <div className="text-xs text-slate-500">
+                      {isSending
+                        ? "Thinking…"
+                        : `${messages.length} message${messages.length === 1 ? "" : "s"}`}
+                    </div>
                   </div>
                 </div>
 
@@ -352,11 +397,6 @@ function App() {
                     >
                       Send
                     </button>
-                  </div>
-
-                  <div className="mt-2 text-[11px] text-slate-500">
-                    API endpoint: <span className="font-mono">{askUrl}</span> · Doc:{" "}
-                    <span className="font-mono">{documentId ?? "default"}</span>
                   </div>
                 </div>
               </section>
